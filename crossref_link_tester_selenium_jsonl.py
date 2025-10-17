@@ -1,28 +1,30 @@
 import argparse
+import json
 import re
 import sys
-import json
-from typing import Tuple, List, Dict, Any
 from pathlib import Path
+from typing import Any, Dict, List, Set, Tuple
 import time
 
+import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 
+
+# ====== Crossref & Genel Ayarlar ======
 CROSSREF_API_TEMPLATE = (
     "https://api.crossref.org/journals/{issn}/works"
     "?select=DOI,prefix,title,publisher,type,resource,URL,ISSN,created,container-title"
     "&rows=100&sort=created&order=asc"
 )
-
 UA = "PiriLinkTester/1.0 (mailto:you@example.com)"
 TIMEOUT = 15
 
 
-# ---------------- Selenium Driver ----------------
-def build_driver():
+# ====== Selenium Driver ======
+def build_driver(detach=True) -> webdriver.Chrome:
     opts = Options()
     opts.add_argument("--window-size=1400,900")
     opts.add_argument("--lang=tr-TR")
@@ -31,8 +33,10 @@ def build_driver():
     opts.add_argument("--disable-gpu")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
-    # pencere kapanmasın
-    opts.add_experimental_option("detach", True)
+    if detach:
+        # İşlem bitince pencere otomatik kapanmasın
+        opts.add_experimental_option("detach", True)
+    # HTTP durumlarını performance log'tan okumayı deneyelim
     opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
 
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
@@ -44,64 +48,20 @@ def build_driver():
     return driver
 
 
-# ---------------- Yardımcı fonksiyonlar ----------------
+# ====== Yardımcılar ======
 def normalize_text(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip().lower()
 
 
-def check_url_selenium(driver, url: str, title_norm: str) -> Tuple[int, bool, str, bool]:
-    """
-    Selenium ile URL'e git → status_code, title var mı, info, erişilebilir mi
-    """
-    if not url:
-        return 0, False, "boş URL", False
-
-    status = 0
-    try:
-        driver.get(url)
-        # --- Status code'u performance log'tan almayı dene ---
-        logs = driver.get_log("performance")
-        for entry in logs:
-            msg = json.loads(entry["message"])["message"]
-            if msg.get("method") == "Network.responseReceived":
-                response = msg.get("params", {}).get("response", {})
-                if response.get("url") == url or url in response.get("url", ""):
-                    status = response.get("status", 0)
-                    break
-
-        # --- HTML içeriğini al ---
-        html = driver.page_source
-        text_norm = normalize_text(html)
-
-        # Eğer status bulunamadıysa içerikten tahmin
-        if status == 0:
-            if "404 not found" in text_norm:
-                status = 404
-            else:
-                status = 200
-
-        if status == 200:
-            if "404 not found" in text_norm:
-                return 404, False, "200 ama body 404 içeriyor ❌", False
-            has_title = title_norm in text_norm if title_norm else False
-            return 200, has_title, "200 OK", True
-        else:
-            return status, False, f"HTTP {status}", False
-
-    except Exception as e:
-        return 0, False, f"Hata: {e}", False
+def append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
-def build_doi_url(doi: str) -> str:
-    doi = (doi or "").strip()
-    if not doi:
-        return ""
-    return f"https://doi.org/{doi}"
-
-
-def read_jsonl_names(path: Path) -> set:
-    """summary.jsonl içindeki journal_name’leri set olarak oku (varsa)."""
-    names = set()
+def read_jsonl_names(path: Path) -> Set[str]:
+    """summary.jsonl içindeki journal_name’leri (küçük harf) set olarak oku."""
+    names: Set[str] = set()
     if path.exists():
         with path.open("r", encoding="utf-8") as f:
             for line in f:
@@ -118,63 +78,128 @@ def read_jsonl_names(path: Path) -> set:
     return names
 
 
-def append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+def get_http_status_and_source(driver: webdriver.Chrome, url: str) -> Tuple[int, str, str]:
+    """URL'e driver.get; performance loglarından Document status; (status, html, final_url) döner."""
+    if not url:
+        return 0, "", ""
+    try:
+        # Önceki logları temizle
+        try:
+            _ = driver.get_log("performance")
+        except Exception:
+            pass
+
+        driver.get(url)
+
+        status_code = 0
+        final_url = driver.current_url or url
+        try:
+            logs = driver.get_log("performance")
+            for entry in logs:
+                try:
+                    msg = json.loads(entry["message"])["message"]
+                except Exception:
+                    continue
+                if msg.get("method") == "Network.responseReceived":
+                    params = msg.get("params", {})
+                    if params.get("type") == "Document":
+                        resp = params.get("response", {})
+                        resp_url = resp.get("url") or ""
+                        code = int(resp.get("status", 0))
+                        # final_url ile eşleşeni tercih et; yoksa en son görüleni al
+                        if resp_url == final_url:
+                            status_code = code
+                        else:
+                            status_code = code
+        except Exception:
+            pass
+
+        html = driver.page_source or ""
+        return status_code, html, final_url
+    except Exception:
+        return 0, "", ""
 
 
-# ---------------- Ana akış ----------------
-def main():
-    parser = argparse.ArgumentParser(description="Crossref link testi (ISSN bazlı) → Selenium + JSONL")
-    parser.add_argument("--issn", default="2148-5704", help="ISSN")
-    parser.add_argument("--summary", default="summary.jsonl", help="Özet JSONL dosyası")
-    parser.add_argument("--detail", default="detail.jsonl", help="Detay JSONL dosyası")
-    args = parser.parse_args()
+def check_url_selenium(driver: webdriver.Chrome, url: str, title_norm: str) -> Tuple[int, bool, str, bool]:
+    """Selenium ile URL'i aç ve değerlendir: (status, has_title, info, is_accessible)."""
+    if not url:
+        return 0, False, "boş URL", False
+    status, html, _ = get_http_status_and_source(driver, url)
+    if not html:
+        return (404 if status == 0 else status), False, "İçerik boş / yüklenemedi", False
 
-    summary_path = Path(args.summary)
-    detail_path = Path(args.detail)
+    text_norm = normalize_text(html)
+    if status == 0:
+        # İçerikten tahmin
+        status = 404 if "404 not found" in text_norm else 200
+    if status == 200:
+        if "404 not found" in text_norm:
+            return 404, False, "200 ama body 404 içeriyor ❌", False
+        has_title = title_norm in text_norm if title_norm else False
+        return 200, has_title, "200 OK", True
+    return status, False, f"HTTP {status}", False
 
-    # API'den makale verisi çek
-    import requests
-    api_url = CROSSREF_API_TEMPLATE.format(issn=args.issn)
+
+def build_doi_url(doi: str) -> str:
+    doi = (doi or "").strip()
+    return f"https://doi.org/{doi}" if doi else ""
+
+
+# ====== Asıl iş: tek ISSN işleme ======
+def process_one_issn(
+    driver: webdriver.Chrome,
+    issn: str,
+    summary_path: Path,
+    detail_path: Path,
+    dp_journal_name: str = None
+) -> None:
+    """Bir ISSN için Crossref -> Selenium doğrulama -> summary/detail JSONL yaz."""
+    api_url = CROSSREF_API_TEMPLATE.format(issn=issn)
     try:
         r = requests.get(api_url, headers={"User-Agent": UA}, timeout=10)
         r.raise_for_status()
     except requests.RequestException as e:
         msg = f"[ERR] Crossref API hatası: {e}"
         print(msg)
-        append_jsonl(detail_path, {"level": "ERROR", "issn": args.issn, "msg": msg})
-        sys.exit(1)
+        append_jsonl(detail_path, {"level": "ERROR", "issn": issn, "msg": msg, "api_url": api_url,
+                                   "dp_journal_name": dp_journal_name})
+        return
 
     data = r.json()
     items = (data.get("message") or {}).get("items") or []
     total = len(items)
 
-    # Dergi adı
+    # Crossref'ten dergi adı
     journal_name = "Unknown Journal"
     if items:
         it0 = items[0]
         ct = it0.get("container-title") or []
-        if ct and ct[0]:
-            journal_name = ct[0].strip()
+        if ct and isinstance(ct, list) and ct[0]:
+            journal_name = (ct[0] or "").strip()
         elif (it0.get("publisher") or "").strip():
-            journal_name = it0.get("publisher").strip()
+            journal_name = (it0.get("publisher") or "").strip()
 
-    # summary'de varsa atla
-    if journal_name.strip().lower() in read_jsonl_names(summary_path):
-        print(f"[INFO] {journal_name} zaten summary.jsonl içinde.")
-        sys.exit(0)
-
-    driver = build_driver()
+    # summary.jsonl’de aynı journal_name varsa atla (mevcut davranışı koru)
+    existing_names = read_jsonl_names(summary_path)
+    if journal_name.strip().lower() in existing_names:
+        info = f"[INFO] summary.jsonl içinde '{journal_name}' zaten var; atlandı."
+        print(info)
+        append_jsonl(detail_path, {
+            "level": "INFO", "event": "skip-existing",
+            "issn": issn, "journal_name": journal_name,
+            "dp_journal_name": dp_journal_name, "msg": info
+        })
+        return
 
     accessible_cnt = 0
     correct_cnt = 0
 
     append_jsonl(detail_path, {
-        "level": "INFO",
-        "event": "start",
+        "level": "INFO", "event": "start",
+        "issn": issn,
         "journal_name": journal_name,
-        "issn": args.issn,
+        "dp_journal_name": dp_journal_name,
+        "api_url": api_url,
         "total": total
     })
 
@@ -184,20 +209,25 @@ def main():
         title = (title_list[0] if title_list else "").strip()
         title_norm = normalize_text(title)
 
-        # URL adayları
-        resource_primary_url = (((it.get("resource") or {}).get("primary") or {}).get("URL") or "").strip()
+        # Aday URL'ler (öncelik sırası)
+        try:
+            resource_primary_url = (
+                ((it.get("resource") or {}).get("primary") or {}).get("URL") or ""
+            ).strip()
+        except Exception:
+            resource_primary_url = ""
         crossref_url = (it.get("URL") or "").strip()
         doi_url = build_doi_url(doi)
 
-        raw_candidates = [
+        raw_candidates: List[Tuple[str, str]] = [
             ("resource.primary.URL", resource_primary_url),
             ("URL", crossref_url),
-            ("DOI", doi_url)
+            ("DOI", doi_url),
         ]
 
-        # dedup
-        unique_urls = []
-        labels_for_url = {}
+        # Dedup: aynı URL tek kez
+        unique_urls: List[str] = []
+        labels_for_url: Dict[str, List[str]] = {}
         for label, url in raw_candidates:
             if not url:
                 continue
@@ -209,14 +239,14 @@ def main():
 
         passed = False
         this_item_accessible = False
-        trials = []
+        trials: List[Dict[str, Any]] = []
 
         for url in unique_urls:
-            label = labels_for_url[url][0]
+            primary_label = labels_for_url[url][0]
             aliases = labels_for_url[url][1:]
             status, has_title, info, is_accessible = check_url_selenium(driver, url, title_norm)
             trials.append({
-                "label": label,
+                "label": primary_label,
                 "aliases": aliases,
                 "url": url,
                 "status": status,
@@ -228,8 +258,8 @@ def main():
                 this_item_accessible = True
             if status == 200 and has_title:
                 passed = True
-                break
-
+                break  # ilk başarılıda dur
+            time.sleep(0.5)
         if this_item_accessible:
             accessible_cnt += 1
         if passed:
@@ -237,7 +267,8 @@ def main():
 
         append_jsonl(detail_path, {
             "journal_name": journal_name,
-            "issn": args.issn,
+            "dp_journal_name": dp_journal_name,
+            "issn": issn,
             "idx": i,
             "total": total,
             "doi": doi,
@@ -247,19 +278,82 @@ def main():
             "trials": trials
         })
 
+    # Özet satırı
     append_jsonl(summary_path, {
-        "journal_name": journal_name,
-        "issn": args.issn,
+        "journal_name": journal_name,         # Crossref'teki isim
+        "dp_journal_name": dp_journal_name,   # DergiPark'taki isim (referans)
+        "issn": issn,
         "total": total,
         "accessible": accessible_cnt,
-        "correct": correct_cnt
+        "correct": correct_cnt,
+        "fetcher": "selenium"
     })
 
-    print(f"[DONE] {journal_name} | total={total} | accessible={accessible_cnt} | correct={correct_cnt}")
-    print(f"[INFO] summary → {summary_path}")
-    print(f"[INFO] detail  → {detail_path}")
+    print(f"[DONE] {journal_name} | ISSN={issn} | total={total} | accessible={accessible_cnt} | correct={correct_cnt}")
 
-    # pencereyi kapatmadan bekle
+
+# ====== Toplu: DergiPark JSON'unu oku ve sırayla ISSN/eISSN ile çalıştır ======
+def main():
+    parser = argparse.ArgumentParser(
+        description="DergiPark JSON → Crossref Selenium toplu doğrulama"
+    )
+    parser.add_argument("--input", default="dergipark_journals_detail.json",
+                        help="DergiPark dergi listesi JSON (array)")
+    parser.add_argument("--summary", default="summary.jsonl", help="Özet JSONL dosyası")
+    parser.add_argument("--detail", default="detail.jsonl", help="Detay JSONL dosyası")
+    parser.add_argument("--max", type=int, default=0, help="İlk N dergi ile sınırla (0=hepsi)")
+    args = parser.parse_args()
+
+    in_path = Path(args.input)
+    if not in_path.exists():
+        print(f"[ERR] Girdi dosyası yok: {in_path.resolve()}")
+        sys.exit(1)
+
+    try:
+        journals = json.loads(in_path.read_text(encoding="utf-8"))
+        if not isinstance(journals, list):
+            raise ValueError("Girdi JSON bir liste (array) olmalı.")
+    except Exception as e:
+        print(f"[ERR] JSON okunamadı: {e}")
+        sys.exit(1)
+
+    summary_path = Path(args.summary)
+    detail_path = Path(args.detail)
+
+    # Tek pencere Selenium
+    driver = build_driver(detach=True)
+
+    processed_issns: Set[str] = set()
+    total_cnt = 0
+    for idx, j in enumerate(journals, start=1):
+        if args.max and total_cnt >= args.max:
+            break
+
+        dp_name = (j.get("journal_name") or "").strip()
+        issn = (j.get("issn") or "").strip()
+        eissn = (j.get("eissn") or "").strip()
+
+        chosen_issn = issn if issn else eissn
+        if not chosen_issn:
+            info = f"[SKIP] ISSN ve eISSN yok: {dp_name}"
+            print(info)
+            append_jsonl(detail_path, {"level": "WARN", "event": "skip-no-issn",
+                                       "dp_journal_name": dp_name})
+            continue
+
+        if chosen_issn in processed_issns:
+            info = f"[SKIP] Aynı ISSN tekrar: {chosen_issn} ({dp_name})"
+            print(info)
+            append_jsonl(detail_path, {"level": "INFO", "event": "skip-dup-issn",
+                                       "issn": chosen_issn, "dp_journal_name": dp_name})
+            continue
+
+        print(f"[RUN] {idx}/{len(journals)}  {dp_name}  → ISSN={chosen_issn}")
+        process_one_issn(driver, chosen_issn, summary_path, detail_path, dp_journal_name=dp_name)
+        processed_issns.add(chosen_issn)
+        total_cnt += 1
+
+    # İstersen kapatmayı manuel bırak
     input("Tarayıcı açık. Kapatmak için Enter'a basın...")
     driver.quit()
 
