@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple
 import time
+from io import BytesIO
 
 import requests
 from selenium import webdriver
@@ -17,10 +18,10 @@ from webdriver_manager.chrome import ChromeDriverManager
 CROSSREF_API_TEMPLATE = (
     "https://api.crossref.org/journals/{issn}/works"
     "?select=DOI,prefix,title,publisher,type,resource,URL,ISSN,created,container-title"
-    "&rows=100&sort=created&order=asc"
+    "&rows=50&sort=created&order=asc"
 )
-UA = "PiriLinkTester/1.0 (mailto:you@example.com)"
-TIMEOUT = 15
+UA = "AcademicLinkTester/1.0"
+TIMEOUT = 5
 
 
 # ====== Selenium Driver ======
@@ -34,9 +35,8 @@ def build_driver(detach=True) -> webdriver.Chrome:
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
     if detach:
-        # İşlem bitince pencere otomatik kapanmasın
         opts.add_experimental_option("detach", True)
-    # HTTP durumlarını performance log'tan okumayı deneyelim
+    # HTTP durumlarını + mimeType'ı performance log'tan okumak için
     opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
 
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
@@ -78,10 +78,52 @@ def read_jsonl_names(path: Path) -> Set[str]:
     return names
 
 
-def get_http_status_and_source(driver: webdriver.Chrome, url: str) -> Tuple[int, str, str]:
-    """URL'e driver.get; performance loglarından Document status; (status, html, final_url) döner."""
+def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
+    """
+    Tercihen pdfminer.six ile PDF metni çıkar. Yoksa kaba fallback:
+    latin-1 decode (errors='ignore') ile byte içinden düz metin ayıklamaya çalış.
+    """
+    try:
+        from pdfminer.high_level import extract_text
+        text = extract_text(BytesIO(pdf_bytes)) or ""
+        return text
+    except Exception:
+        # pdfminer yoksa/başarısızsa kaba fallback
+        try:
+            return pdf_bytes.decode("latin-1", errors="ignore")
+        except Exception:
+            return ""
+
+
+def fetch_pdf_text(url: str) -> Tuple[int, str]:
+    """
+    PDF içeriğini indirip metne çevir. (status_code, text_norm) döndür.
+    """
+    try:
+        resp = requests.get(
+            url,
+            headers={"User-Agent": UA},
+            allow_redirects=True,
+            timeout=15,
+            verify=True,
+        )
+        status = resp.status_code
+        if status != 200 or not resp.content:
+            return status, ""
+        # Bazı sunucular yanlış content-type verebilir; doğrudan PDF bytes'tan dene
+        text = extract_text_from_pdf_bytes(resp.content)
+        return status, normalize_text(text)
+    except requests.RequestException:
+        return 0, ""
+
+
+def get_http_status_source_mime(driver: webdriver.Chrome, url: str) -> Tuple[int, str, str, str]:
+    """
+    URL'e driver.get; performance loglarından Document status + mimeType'ı bul.
+    Dönüş: (status_code_or_0, page_source, final_url, mimeType_or_empty)
+    """
     if not url:
-        return 0, "", ""
+        return 0, "", "", ""
     try:
         # Önceki logları temizle
         try:
@@ -92,7 +134,9 @@ def get_http_status_and_source(driver: webdriver.Chrome, url: str) -> Tuple[int,
         driver.get(url)
 
         status_code = 0
+        mime_type = ""
         final_url = driver.current_url or url
+
         try:
             logs = driver.get_log("performance")
             for entry in logs:
@@ -106,31 +150,63 @@ def get_http_status_and_source(driver: webdriver.Chrome, url: str) -> Tuple[int,
                         resp = params.get("response", {})
                         resp_url = resp.get("url") or ""
                         code = int(resp.get("status", 0))
-                        # final_url ile eşleşeni tercih et; yoksa en son görüleni al
+                        mtype = resp.get("mimeType") or ""
+                        # final_url ile eşleşeni tercih et; yoksa son görüleni al
                         if resp_url == final_url:
                             status_code = code
+                            mime_type = mtype or mime_type
                         else:
                             status_code = code
+                            mime_type = mtype or mime_type
         except Exception:
             pass
 
         html = driver.page_source or ""
-        return status_code, html, final_url
+        return status_code, html, final_url, (mime_type or "")
     except Exception:
-        return 0, "", ""
+        return 0, "", "", ""
+
+
+def is_pdf_mime_or_url(mime_type: str, url: str) -> bool:
+    mime_type = (mime_type or "").lower()
+    url_l = (url or "").lower()
+    return ("application/pdf" in mime_type) or url_l.endswith(".pdf")
 
 
 def check_url_selenium(driver: webdriver.Chrome, url: str, title_norm: str) -> Tuple[int, bool, str, bool]:
-    """Selenium ile URL'i aç ve değerlendir: (status, has_title, info, is_accessible)."""
+    """
+    Selenium ile URL'i aç ve değerlendir:
+      - HTTP status,
+      - başlık var mı,
+      - info,
+      - erişilebilir mi (200 + body '404 not found' değil).
+    PDF ise bytes indirip PDF metninde başlık ara.
+    """
     if not url:
         return 0, False, "boş URL", False
-    status, html, _ = get_http_status_and_source(driver, url)
+
+    status, html, final_url, mime_type = get_http_status_source_mime(driver, url)
+
+    # Eğer PDF ise: requests ile indir → metni çıkar → başlık ara
+    if is_pdf_mime_or_url(mime_type, final_url):
+        pdf_status, pdf_text_norm = fetch_pdf_text(final_url)
+        # status belirleme mantığı
+        st = pdf_status if pdf_status != 0 else (status if status != 0 else 200)
+        if st == 200:
+            # PDF'te '404 not found' beklenmez ama yine de kontrol edebiliriz
+            if "404 not found" in pdf_text_norm:
+                return 404, False, "PDF 200 ama içerikte '404 not found' var ❌", False
+            has_title = title_norm in pdf_text_norm if title_norm else False
+            return 200, has_title, "200 OK (PDF)", True
+        else:
+            return st, False, f"HTTP {st} (PDF)", False
+
+    # HTML benzeri: eski mantık
     if not html:
         return (404 if status == 0 else status), False, "İçerik boş / yüklenemedi", False
 
     text_norm = normalize_text(html)
     if status == 0:
-        # İçerikten tahmin
         status = 404 if "404 not found" in text_norm else 200
     if status == 200:
         if "404 not found" in text_norm:
@@ -259,7 +335,9 @@ def process_one_issn(
             if status == 200 and has_title:
                 passed = True
                 break  # ilk başarılıda dur
+            # nazik gecikme: hedef siteleri yormamak için
             time.sleep(0.5)
+
         if this_item_accessible:
             accessible_cnt += 1
         if passed:
@@ -295,7 +373,7 @@ def process_one_issn(
 # ====== Toplu: DergiPark JSON'unu oku ve sırayla ISSN/eISSN ile çalıştır ======
 def main():
     parser = argparse.ArgumentParser(
-        description="DergiPark JSON → Crossref Selenium toplu doğrulama"
+        description="DergiPark JSON → Crossref Selenium toplu doğrulama (PDF destekli)"
     )
     parser.add_argument("--input", default="dergipark_journals_detail.json",
                         help="DergiPark dergi listesi JSON (array)")
@@ -322,13 +400,15 @@ def main():
 
     # Tek pencere Selenium
     driver = build_driver(detach=True)
-
+    START_INDEX = 2162
     processed_issns: Set[str] = set()
     total_cnt = 0
     for idx, j in enumerate(journals, start=1):
         if args.max and total_cnt >= args.max:
             break
-
+        if idx < START_INDEX:
+            continue
+            
         dp_name = (j.get("journal_name") or "").strip()
         issn = (j.get("issn") or "").strip()
         eissn = (j.get("eissn") or "").strip()
@@ -353,7 +433,6 @@ def main():
         processed_issns.add(chosen_issn)
         total_cnt += 1
 
-    # İstersen kapatmayı manuel bırak
     input("Tarayıcı açık. Kapatmak için Enter'a basın...")
     driver.quit()
 
